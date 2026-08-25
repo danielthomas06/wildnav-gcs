@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>WildNav — Mission Control</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- ============ HEADER ============ -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="glyph">◎</span>
+      <div>
+        <div class="brand-name">WILDNAV</div>
+        <div class="brand-sub">GNSS-denied mission control</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px">
+      <button class="gear" id="gearBtn" onclick="toggleSettings()" title="Drone settings">⚙</button>
+      <div class="conn" id="conn">
+        <span class="conn-dot" id="connDot"></span>
+        <span id="connText">connecting…</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ============ SETTINGS PANEL ============ -->
+  <section class="stage hidden" id="stageSettings">
+    <div class="stage-head">
+      <div class="stage-num">⚙</div>
+      <div>
+        <h2>Drone settings</h2>
+        <p>Device-level configuration. These persist on the drone.</p>
+      </div>
+      <button class="btn ghost sm" style="margin-left:auto" onclick="toggleSettings()">← Back</button>
+    </div>
+
+    <div class="settings-grid">
+      <div class="panel">
+        <div class="panel-title">Device name</div>
+        <div class="set-row">
+          <input id="setName" placeholder="drone-alpha" autocomplete="off">
+          <button class="btn ghost sm" onclick="saveName()">Save</button>
+        </div>
+        <div class="set-note">Letters, digits, - and _ only. Beacon &amp; discovery pick it up on next agent restart.</div>
+        <div class="set-feedback hidden" id="nameFeedback"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Autostart on boot</div>
+        <div class="set-row">
+          <label class="switch">
+            <input type="checkbox" id="autostartToggle" onchange="setAutostart(this.checked)">
+            <span class="slider"></span>
+          </label>
+          <span class="set-inline" id="autostartText">…</span>
+        </div>
+        <div class="set-note">Launches the agent automatically every time the drone computer powers on (systemd service).</div>
+        <div class="set-feedback hidden" id="autostartFeedback"></div>
+      </div>
+
+      <div class="panel" style="grid-column:1/-1">
+        <div class="panel-title">SuperPoint → TensorRT conversion</div>
+        <div class="set-row">
+          <div class="speed-input" style="max-width:130px">
+            <input id="trtWidth" type="number" value="1280" min="64" max="4096" step="16">
+            <span class="unit">w</span>
+          </div>
+          <span class="set-inline">×</span>
+          <div class="speed-input" style="max-width:130px">
+            <input id="trtHeight" type="number" value="720" min="64" max="4096" step="16">
+            <span class="unit">h</span>
+          </div>
+          <button class="btn ghost sm" id="trtBtn" onclick="startTrt()">Convert</button>
+          <span class="set-inline" id="trtStatus"></span>
+        </div>
+        <div class="set-note">Rebuilds the FP16 TensorRT engine at a new input resolution. Takes 5–10 min on Jetson; blocked while a mission is active.</div>
+        <div class="tool-log hidden" id="trtLog"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ STAGE 1: DISCOVERY ============ -->
+  <section class="stage" id="stageDiscovery">
+    <div class="stage-head">
+      <div class="stage-num">01</div>
+      <div>
+        <h2>Select drone</h2>
+        <p>Drones on this network appear automatically. Or enter an IP.</p>
+      </div>
+    </div>
+    <div class="drone-list" id="droneList">
+      <div class="empty">Scanning…</div>
+    </div>
+    <div class="manual-ip">
+      <input id="manualIp" placeholder="Drone IP — e.g. 192.168.1.42" autocomplete="off">
+      <button class="btn ghost" onclick="connectManual()">Connect</button>
+    </div>
+  </section>
+
+  <!-- ============ STAGE 2: MISSION CONFIG ============ -->
+  <section class="stage hidden" id="stageConfig">
+    <div class="stage-head">
+      <div class="stage-num">02</div>
+      <div>
+        <h2>Plan mission — <span class="drone-tag" id="cfgDroneName">drone</span></h2>
+        <p>Upload a reference map, drop waypoints, choose a mode, and launch.</p>
+      </div>
+    </div>
+
+    <div class="config-grid">
+      <!-- LEFT: map + waypoints -->
+      <div class="map-col">
+        <div class="map-frame" id="mapFrame">
+          <div class="map-placeholder" id="mapPlaceholder">
+            <label class="upload-btn">
+              Upload GeoTIFF map
+              <input type="file" id="mapFile" accept=".tif,.tiff,image/tiff" hidden>
+            </label>
+            <span class="hint">Georeferenced GeoTIFF of your area — used for both waypoint picking and the drone's localization. Click the footprint to drop waypoints.</span>
+          </div>
+          <canvas id="mapCanvas" class="hidden"></canvas>
+        </div>
+        <div class="map-error hidden" id="mapError"></div>
+        <div class="map-meta hidden" id="mapMeta"></div>
+        <div class="wp-toolbar">
+          <div class="wp-mode">
+            <button class="pill active" id="pinModeBtn" onclick="setPinMode('waypoint')">Drop waypoints</button>
+            <button class="pill" id="startModeBtn" onclick="setPinMode('start')">Set approx start</button>
+          </div>
+          <button class="btn ghost sm" onclick="clearWaypoints()">Clear</button>
+        </div>
+      </div>
+
+      <!-- RIGHT: parameters -->
+      <div class="params-col">
+
+        <!-- Waypoint list -->
+        <div class="panel">
+          <div class="panel-title">Waypoints <span class="count" id="wpCount">0</span></div>
+          <div class="wp-entry">
+            <input id="wpLat" placeholder="lat" inputmode="decimal">
+            <input id="wpLon" placeholder="lon" inputmode="decimal">
+            <button class="btn ghost sm" onclick="addManualWaypoint()">Add</button>
+          </div>
+          <ul class="wp-list" id="wpList"></ul>
+          <div class="approx-start-readout hidden" id="approxStartRow">
+            <span class="tag-start">START</span>
+            <span id="approxStartText">—</span>
+            <button class="x" onclick="clearApproxStart()">×</button>
+          </div>
+        </div>
+
+        <!-- Mode -->
+        <div class="panel">
+          <div class="panel-title">Navigation mode</div>
+          <div class="mode-cards" id="modeCards"></div>
+          <div class="mode-explain" id="modeExplain"></div>
+        </div>
+
+        <!-- Flight params -->
+        <div class="panel">
+          <div class="panel-title">Flight parameters</div>
+          <div class="field-row">
+            <label>Altitude</label>
+            <select id="altSelect">
+              <option value="120">120 m AGL</option>
+            </select>
+          </div>
+          <div class="field-row">
+            <label>Speed</label>
+            <div class="speed-input">
+              <input id="speedInput" type="number" value="2.5" step="0.5" min="0.5" max="10">
+              <span class="unit">m/s</span>
+            </div>
+          </div>
+          <div class="field-row">
+            <label>Min valid altitude
+              <span class="tip" title="Localizations below this altitude are discarded. Guarantees the first fix is taken at cruise altitude.">?</span>
+            </label>
+            <div class="speed-input">
+              <input id="minAltInput" type="number" value="90" step="5" min="0" max="120">
+              <span class="unit">m</span>
+            </div>
+          </div>
+        </div>
+
+        <button class="btn launch" id="launchBtn" onclick="launch()" disabled>
+          <span class="launch-icon">▲</span> Start mission
+        </button>
+        <div class="launch-note" id="launchNote">Add at least one waypoint to launch.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ STAGE 3: LIVE MISSION ============ -->
+  <section class="stage hidden" id="stageLive">
+    <div class="stage-head">
+      <div class="stage-num live-num">●</div>
+      <div>
+        <h2>Mission live — <span class="drone-tag" id="liveDroneName">drone</span></h2>
+        <p id="livePhase">Initializing…</p>
+      </div>
+      <button class="btn stop" onclick="stopMission()">■ STOP</button>
+    </div>
+
+    <div class="live-grid">
+      <!-- Telemetry readouts -->
+      <div class="telemetry">
+        <div class="tel-card">
+          <div class="tel-label">STATE</div>
+          <div class="tel-value" id="telState">—</div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">LEG</div>
+          <div class="tel-value" id="telLeg">—</div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">AGL</div>
+          <div class="tel-value" id="telAgl">—<span class="tel-unit">m</span></div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">DIST TO TARGET</div>
+          <div class="tel-value" id="telDist">—<span class="tel-unit">m</span></div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">CROSS-TRACK</div>
+          <div class="tel-value" id="telCte">—<span class="tel-unit">m</span></div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">HEADING</div>
+          <div class="tel-value" id="telHdg">—<span class="tel-unit">°</span></div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">EKF↔GPS ERR</div>
+          <div class="tel-value" id="telErr">—<span class="tel-unit">m</span></div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">INLIERS</div>
+          <div class="tel-value" id="telInliers">—</div>
+        </div>
+      </div>
+
+      <!-- Event log -->
+      <div class="log-panel">
+        <div class="log-head">
+          <span>EVENT LOG</span>
+          <span class="log-status" id="logStatus">●</span>
+        </div>
+        <div class="log-body" id="logBody"></div>
+      </div>
+    </div>
+  </section>
+
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>WildNav — Cloud Dashboard</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  .right-col{display:flex;flex-direction:column;gap:22px}
+  .map-panel{background:var(--panel);border:1px solid var(--edge);border-radius:13px;
+    overflow:hidden;height:280px;display:flex;flex-direction:column}
+  .map-head{display:flex;align-items:center;justify-content:space-between;
+    padding:12px 16px;border-bottom:1px solid var(--edge);font-family:var(--mono);
+    font-size:11px;letter-spacing:.14em;color:var(--mute)}
+  .map-legend{display:flex;gap:12px;font-size:10.5px;letter-spacing:0}
+  .map-legend span{display:flex;align-items:center;gap:5px}
+  .map-legend i{width:8px;height:8px;border-radius:50%;display:inline-block}
+  #mapView{flex:1;background:var(--void)}
+  .leaflet-container{background:var(--void) !important;font-family:var(--mono) !important}
+  .wp-label{background:var(--panel2) !important;border:1px solid var(--edge) !important;
+    color:var(--ink) !important;font-family:var(--mono) !important;font-size:10px !important;
+    box-shadow:none !important}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ============ HEADER ============ -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="glyph">◎</span>
+      <div>
+        <div class="brand-name">WILDNAV</div>
+        <div class="brand-sub">cloud dashboard — view only</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px">
+      <button class="gear" id="settingsBtn" onclick="toggleConnPanel()" title="Broker connection">⚙</button>
+      <div class="conn" id="conn">
+        <span class="conn-dot" id="connDot"></span>
+        <span id="connText">not connected</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ============ BROKER CONNECTION PANEL ============ -->
+  <section class="stage" id="stageConn">
+    <div class="stage-head">
+      <div class="stage-num">⚙</div>
+      <div>
+        <h2>Connect to broker</h2>
+        <p>Read-only dashboard credentials for the MQTT broker — saved in this browser only.</p>
+      </div>
+    </div>
+    <div class="settings-grid">
+      <div class="panel">
+        <div class="panel-title">Broker</div>
+        <div class="set-row"><input id="cHost" placeholder="e.g. xxxx.s1.eu.hivemq.cloud" autocomplete="off"></div>
+        <div class="set-row">
+          <input id="cPort" placeholder="port" value="8884" style="max-width:100px">
+          <input id="cPath" placeholder="path" value="/mqtt" style="max-width:120px">
+          <label style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:12.5px;color:var(--mute)">
+            <input type="checkbox" id="cTls" checked style="width:auto"> TLS (wss)
+          </label>
+        </div>
+        <div class="set-note">HiveMQ Cloud default: port 8884, path /mqtt, TLS on.</div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Credentials</div>
+        <div class="set-row"><input id="cUser" placeholder="username" autocomplete="off"></div>
+        <div class="set-row"><input id="cPass" type="password" placeholder="password" autocomplete="off"></div>
+        <div class="set-row">
+          <button class="btn ghost sm" onclick="connectBroker()">Connect</button>
+          <button class="btn ghost sm" onclick="disconnectBroker()">Disconnect</button>
+        </div>
+        <div class="set-note">Use a read-only credential scoped to subscribe on <code>wildnav/+/#</code> — never the drone's own publish credential.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ LIVE VIEW ============ -->
+  <section class="stage hidden" id="stageLive">
+    <div class="stage-head">
+      <div class="stage-num live-num">●</div>
+      <div>
+        <h2>Live — <span class="drone-tag" id="liveDroneName">no drone selected</span></h2>
+        <p id="livePhase">Waiting for a drone to publish…</p>
+      </div>
+      <select id="dronePicker" class="btn ghost sm" style="margin-left:auto" onchange="selectDrone(this.value)"></select>
+    </div>
+
+    <div class="live-grid">
+      <!-- Telemetry readouts -->
+      <div class="telemetry">
+        <div class="tel-card">
+          <div class="tel-label">LINK</div>
+          <div class="tel-value" id="telLink">—</div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">STATE</div>
+          <div class="tel-value" id="telState">—</div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">LEG</div>
+          <div class="tel-value" id="telLeg">—</div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">AGL</div>
+          <div class="tel-value" id="telAgl">—<span class="tel-unit">m</span></div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">DIST TO TARGET</div>
+          <div class="tel-value" id="telDist">—<span class="tel-unit">m</span></div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">CROSS-TRACK</div>
+          <div class="tel-value" id="telCte">—<span class="tel-unit">m</span></div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">HEADING</div>
+          <div class="tel-value" id="telHdg">—<span class="tel-unit">°</span></div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">LAST SEEN</div>
+          <div class="tel-value" id="telLastSeen">—</div>
+        </div>
+        <div class="tel-card">
+          <div class="tel-label">LATENCY</div>
+          <div class="tel-value" id="telLatency">—</div>
+        </div>
+      </div>
+
+      <div class="right-col">
+        <!-- Map: waypoints + live GPS + EKF-estimated position -->
+        <div class="map-panel">
+          <div class="map-head">
+            <span>MAP</span>
+            <span class="map-legend">
+              <span><i style="background:#35e08a"></i>GPS</span>
+              <span><i style="background:#f0a830"></i>EKF est.</span>
+              <span><i style="background:#dfe7ee"></i>waypoint</span>
+            </span>
+          </div>
+          <div id="mapView"></div>
+        </div>
+
+        <!-- Event + terminal log -->
+        <div class="log-panel">
+          <div class="log-head">
+            <span>EVENTS + TERMINAL OUTPUT</span>
+            <span class="log-status" id="logStatus">●</span>
+          </div>
+          <div class="log-body" id="logBody"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</div>
+<script src="/static/cloud.js"></script>
+</body>
+</html>

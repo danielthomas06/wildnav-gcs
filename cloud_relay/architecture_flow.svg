@@ -1,0 +1,77 @@
+<svg width="680" height="644" viewBox="0 0 680 644" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>WildNav cloud telemetry and command flow</title>
+<desc>Flow diagram: the Jetson on the drone publishes telemetry, status and heartbeat messages over 5G cellular to a cloud MQTT broker (HiveMQ Cloud or AWS IoT Core), which forwards them to a ground dashboard in a browser. The reverse path carries STOP, LOITER and RTL commands from the dashboard back through the broker and cellular link to the drone.</desc>
+<style>
+  text { font-family: Arial, Helvetica, sans-serif; }
+  .title { font-size: 14px; font-weight: 600; }
+  .subtitle { font-size: 12px; font-weight: 400; }
+  .label { font-size: 12px; font-weight: 400; fill: #5F5E5A; }
+  .box-teal { fill: #E1F5EE; stroke: #0F6E56; stroke-width: 0.5; }
+  .box-teal .title { fill: #085041; }
+  .box-teal .subtitle { fill: #0F6E56; }
+  .box-gray { fill: #F1EFE8; stroke: #5F5E5A; stroke-width: 0.5; }
+  .box-gray .title { fill: #444441; }
+  .box-gray .subtitle { fill: #5F5E5A; }
+  .box-purple { fill: #EEEDFE; stroke: #534AB7; stroke-width: 0.5; }
+  .box-purple .title { fill: #3C3489; }
+  .box-purple .subtitle { fill: #534AB7; }
+  .box-coral { fill: #FAECE7; stroke: #993C1D; stroke-width: 0.5; }
+  .box-coral .title { fill: #712B13; }
+  .box-coral .subtitle { fill: #993C1D; }
+  @media (prefers-color-scheme: dark) {
+    svg { background: #1a1a18; }
+    .label { fill: #B4B2A9; }
+    .box-teal { fill: #085041; stroke: #5DCAA5; }
+    .box-teal .title { fill: #9FE1CB; }
+    .box-teal .subtitle { fill: #5DCAA5; }
+    .box-gray { fill: #444441; stroke: #B4B2A9; }
+    .box-gray .title { fill: #D3D1C7; }
+    .box-gray .subtitle { fill: #B4B2A9; }
+    .box-purple { fill: #3C3489; stroke: #AFA9EC; }
+    .box-purple .title { fill: #CECBF6; }
+    .box-purple .subtitle { fill: #AFA9EC; }
+    .box-coral { fill: #712B13; stroke: #F0997B; }
+    .box-coral .title { fill: #F5C4B3; }
+    .box-coral .subtitle { fill: #F0997B; }
+  }
+</style>
+<defs>
+<marker id="arrow-teal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#1D9E75" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+<marker id="arrow-coral" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#D85A30" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+</defs>
+
+<g class="box-teal">
+<rect x="180" y="50" width="320" height="56" rx="8"/>
+<text class="title" x="340" y="68" text-anchor="middle" dominant-baseline="central">Jetson (drone)</text>
+<text class="subtitle" x="340" y="90" text-anchor="middle" dominant-baseline="central">publishes over 5G</text>
+</g>
+
+<text class="label" x="340" y="124" text-anchor="middle">telemetry, status, heartbeat</text>
+<line x1="300" y1="134" x2="300" y2="188" stroke="#1D9E75" stroke-width="1.5" marker-end="url(#arrow-teal)"/>
+<line x1="380" y1="188" x2="380" y2="134" stroke="#D85A30" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-coral)"/>
+<text class="label" x="340" y="202" text-anchor="middle">commands: STOP / LOITER / RTL</text>
+
+<g class="box-gray">
+<rect x="180" y="216" width="320" height="56" rx="8"/>
+<text class="title" x="340" y="234" text-anchor="middle" dominant-baseline="central">5G / cellular network</text>
+<text class="subtitle" x="340" y="256" text-anchor="middle" dominant-baseline="central">outbound-only, NAT'd</text>
+</g>
+
+<line x1="300" y1="300" x2="300" y2="354" stroke="#1D9E75" stroke-width="1.5" marker-end="url(#arrow-teal)"/>
+<line x1="380" y1="354" x2="380" y2="300" stroke="#D85A30" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-coral)"/>
+
+<g class="box-purple">
+<rect x="180" y="382" width="320" height="56" rx="8"/>
+<text class="title" x="340" y="400" text-anchor="middle" dominant-baseline="central">MQTT broker (cloud)</text>
+<text class="subtitle" x="340" y="422" text-anchor="middle" dominant-baseline="central">HiveMQ Cloud or AWS IoT Core</text>
+</g>
+
+<line x1="300" y1="466" x2="300" y2="520" stroke="#1D9E75" stroke-width="1.5" marker-end="url(#arrow-teal)"/>
+<line x1="380" y1="520" x2="380" y2="466" stroke="#D85A30" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-coral)"/>
+
+<g class="box-coral">
+<rect x="180" y="548" width="320" height="56" rx="8"/>
+<text class="title" x="340" y="566" text-anchor="middle" dominant-baseline="central">Ground dashboard</text>
+<text class="subtitle" x="340" y="588" text-anchor="middle" dominant-baseline="central">browser via MQTT-WS</text>
+</g>
+</svg>
