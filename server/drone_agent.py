@@ -812,7 +812,7 @@ async def _event_pump():
 async def _on_startup():
     asyncio.create_task(_event_pump())
     # No-ops unless WILDNAV_MQTT_HOST is set — see cloud_relay.py.
-    cloud_relay.relay.start(DRONE_NAME, on_cmd=_handle_cloud_cmd)
+    cloud_relay.relay.start(DRONE_NAME, on_cmd=_handle_cloud_cmd, get_mission_active=RUNNER.is_active)
     # So a dashboard connecting right after a restart sees pre-staged maps
     # immediately (retained topic), not just ones uploaded during this run.
     _publish_maps_list()

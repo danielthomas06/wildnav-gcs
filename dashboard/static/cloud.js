@@ -56,6 +56,17 @@ function initMap() {
   // once one's confirmed running, clicks are ignored (see onMapClickForPlanning)
   // so you can't confuse "picked but not sent" with "actually flying".
   M.map.on('click', onMapClickForPlanning);
+  updateMapCursor();
+}
+
+// Leaflet's default container cursor is "grab" (pan affordance), which gives
+// no visual hint that a click drops a pin during planning — swap to a
+// crosshair whenever a click would actually place one, back to the normal
+// grab cursor once a mission is live (clicks are ignored then, see
+// onMapClickForPlanning).
+function updateMapCursor() {
+  if (!M.map) return;
+  M.map.getContainer().classList.toggle('planning-cursor', !S.missionActive);
 }
 
 function resetMap() {
@@ -105,6 +116,7 @@ function setPlanPinMode(mode) {
   S.plan.pinMode = mode;
   document.getElementById('cloudPinModeBtn').classList.toggle('active', mode === 'waypoint');
   document.getElementById('cloudStartModeBtn').classList.toggle('active', mode === 'start');
+  updateMapCursor();
 }
 
 function renderPlanApproxStart() {
@@ -175,6 +187,7 @@ function updateStartPinGating() {
 function updatePlanControlsEnabled() {
   const note = document.getElementById('planNote');
   const btn = document.getElementById('planLaunchBtn');
+  updateMapCursor();
   if (!note || !btn) return;
   btn.disabled = !canLaunch();
   if (S.missionActive) {
@@ -354,20 +367,31 @@ function onMqttMessage(topic, payloadBuf) {
   if (sub === 'maps') S.mapsByDrone.set(droneId, data); // same — a wildcard sub sees every drone
   if (droneId !== S.selectedDrone) return;
 
-  // status and lwt carry the same {status, ts} shape — cloud_relay.py
-  // publishes a retained "online" birth message to BOTH on every connect,
-  // so a stale retained "offline" from a past ungraceful disconnect never
-  // outlives a fresh reconnect. Read the payload, don't assume the topic.
+  // status and lwt carry the same {status, ts, mission_active?} shape —
+  // cloud_relay.py publishes a retained "online" birth message to BOTH on
+  // every connect, so a stale retained "offline" from a past ungraceful
+  // disconnect never outlives a fresh reconnect. Read the payload, don't
+  // assume the topic.
   if (sub === 'status' || sub === 'lwt') {
     updateLastSeen(data.ts);
     setTel('telLink', data.status === 'online' ? 'ONLINE' : 'OFFLINE');
+    // This 5Hz retained heartbeat is the only authoritative "is a mission
+    // actually running" signal — see the `mission` handler below for why
+    // that topic can't be trusted for this.
+    if (typeof data.mission_active === 'boolean' && data.mission_active !== S.missionActive) {
+      S.missionActive = data.mission_active;
+      updatePlanControlsEnabled();
+    }
     return;
   }
   if (sub === 'events') { updateLatency(data.ts); handleEvent(data.event || {}); return; }
   if (sub === 'mission') {
+    // Retained on its own topic so a dashboard connecting mid-mission gets
+    // the waypoint list immediately — but it's retained forever, so it still
+    // holds the *last* mission ever started even long after that one ended.
+    // Never infer "active" from its mere presence; trust the status
+    // heartbeat's mission_active instead (see above).
     renderMission(data);
-    S.missionActive = true;
-    updatePlanControlsEnabled();
     return;
   }
   if (sub === 'cmd_ack') { handleCmdAck(data); return; }
@@ -418,7 +442,10 @@ function registerDrone(droneId, sub, data) {
   const now = Date.now();
   const existing = S.drones.get(droneId) || {};
   existing.lastSeen = now;
-  if (sub === 'status' || sub === 'lwt') existing.status = data.status;
+  if (sub === 'status' || sub === 'lwt') {
+    existing.status = data.status;
+    if (typeof data.mission_active === 'boolean') existing.missionActive = data.mission_active;
+  }
   S.drones.set(droneId, existing);
   refreshDronePicker();
   if (!S.selectedDrone) selectDrone(droneId);
@@ -451,14 +478,17 @@ function selectDrone(id) {
   S.plan.waypoints = [];
   S.plan.approxStart = null;
   setPlanPinMode('waypoint');
-  S.missionActive = false;
+  // Seed from the last status heartbeat we've seen for this drone, if any —
+  // that's the authoritative live signal (see onMqttMessage); don't infer
+  // it from the mission topic, which stays retained long after a mission ends.
+  S.missionActive = !!(d && d.missionActive);
   const cachedMaps = S.mapsByDrone.get(id);
   S.availableMaps = cachedMaps ? (cachedMaps.files || []) : [];
   S.activeMap = cachedMaps ? (cachedMaps.active || null) : null;
   renderMapSelect();
   updatePlanControlsEnabled();
   const cachedMission = S.missions.get(id);
-  if (cachedMission) { renderMission(cachedMission); S.missionActive = true; updatePlanControlsEnabled(); }
+  if (cachedMission) renderMission(cachedMission);
 }
 
 /* ---------- rendering (mirrors static/app.js) ---------- */

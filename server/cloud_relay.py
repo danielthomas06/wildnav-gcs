@@ -108,6 +108,7 @@ class CloudRelay:
         self._drone_id = None
         self._seq = 0
         self._on_cmd = None
+        self._get_mission_active = None
 
     def _next_seq(self):
         self._seq += 1
@@ -116,11 +117,19 @@ class CloudRelay:
     def is_connected(self) -> bool:
         return bool(self._client and self._client.is_connected())
 
-    def start(self, drone_id: str, on_cmd=None):
+    def start(self, drone_id: str, on_cmd=None, get_mission_active=None):
         """on_cmd(action, params) -> (ok, message) — called synchronously
         when a wildnav/<id>/cmd message arrives. Monitoring-only if omitted
-        (no subscribe happens at all — see _make_on_connect)."""
+        (no subscribe happens at all — see _make_on_connect).
+
+        get_mission_active() -> bool, polled on every retained status
+        heartbeat (see _heartbeat_loop) so a dashboard always has a fresh,
+        authoritative "is a mission actually running right now" signal to
+        gate waypoint planning on — the retained `mission` topic itself only
+        ever reflects the *last* mission_config ever sent, with no way to
+        tell a completed one from a live one on a fresh connect."""
         self._on_cmd = on_cmd
+        self._get_mission_active = get_mission_active
         host = os.environ.get("WILDNAV_MQTT_HOST")
         if not host:
             print("[cloud_relay] WILDNAV_MQTT_HOST not set — cloud relay disabled")
@@ -194,7 +203,7 @@ class CloudRelay:
     def _make_on_connect(self, client):
         def _on_connect(*args, **kwargs):
             print(f"[cloud_relay] connected to broker")
-            payload = json.dumps({"status": "online", "ts": time.time()})
+            payload = json.dumps(self._status_payload())
             status_topic = TOPIC_STATUS.format(id=self._drone_id)
             client.publish(status_topic, payload, qos=1, retain=True)
             # "Birth" message on the SAME topic the Will ("death" message)
@@ -319,12 +328,20 @@ class CloudRelay:
         status_topic = TOPIC_STATUS.format(id=self._drone_id)
         while self._running:
             try:
-                self._client.publish(status_topic, json.dumps({
-                    "status": "online", "ts": time.time(),
-                }), qos=1, retain=True)
+                self._client.publish(status_topic, json.dumps(
+                    self._status_payload()), qos=1, retain=True)
             except Exception:
                 pass
             time.sleep(_HEARTBEAT_PERIOD_S)
+
+    def _status_payload(self):
+        payload = {"status": "online", "ts": time.time()}
+        if self._get_mission_active is not None:
+            try:
+                payload["mission_active"] = bool(self._get_mission_active())
+            except Exception:
+                pass
+        return payload
 
     def stop(self):
         self._running = False
