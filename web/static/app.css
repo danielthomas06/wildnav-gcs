@@ -202,7 +202,7 @@ select{cursor:pointer;appearance:none;
   font-size:11.5px;font-weight:500;padding:7px 12px;border-radius:6px;
   cursor:pointer;transition:.15s;letter-spacing:.02em}
 .pill.active{background:var(--azure);color:#04121f;font-weight:700}
-.pill#startModeBtn.active{background:var(--amber);color:#1a1204}
+.pill#startModeBtn.active,.pill#cloudStartModeBtn.active{background:var(--amber);color:#1a1204}
 
 /* panels */
 .params-col{display:flex;flex-direction:column;gap:16px}
@@ -234,7 +234,7 @@ select{cursor:pointer;appearance:none;
   font-size:12px}
 .tag-start{background:var(--amber);color:#1a1204;font-weight:700;font-size:10px;
   padding:2px 7px;border-radius:5px;letter-spacing:.05em}
-#approxStartText{flex:1;color:var(--amber)}
+#approxStartText,#cloudApproxStartText{flex:1;color:var(--amber)}
 
 /* mode cards */
 .mode-cards{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}

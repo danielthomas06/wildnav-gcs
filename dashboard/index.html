@@ -104,7 +104,21 @@
         </select>
       </div>
       <div class="mode-cards" id="planModeCards" style="margin-bottom:12px"></div>
-      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+
+      <div class="wp-toolbar">
+        <div class="wp-mode">
+          <button class="pill active" id="cloudPinModeBtn" onclick="setPlanPinMode('waypoint')">Drop waypoints</button>
+          <button class="pill" id="cloudStartModeBtn" onclick="setPlanPinMode('start')">Set approx start</button>
+        </div>
+        <button class="btn ghost sm" onclick="clearPlanWaypoints()">Clear waypoints</button>
+      </div>
+      <div class="approx-start-readout hidden" id="cloudApproxStartRow">
+        <span class="tag-start">START</span>
+        <span id="cloudApproxStartText">—</span>
+        <button class="x" onclick="clearPlanApproxStart()">×</button>
+      </div>
+
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:12px">
         <div class="speed-input" style="max-width:110px">
           <input id="planAlt" type="number" value="120" step="5" min="10" max="200">
           <span class="unit">m alt</span>
@@ -118,7 +132,6 @@
           <span class="unit">min-alt m</span>
         </div>
         <span class="set-inline">Waypoints: <b id="planWpCount">0</b></span>
-        <button class="btn ghost sm" onclick="clearPlanWaypoints()">Clear</button>
       </div>
       <div style="display:flex;gap:12px;align-items:center;margin-top:14px">
         <button class="btn launch" id="planLaunchBtn" onclick="launchFromCloud()" disabled>

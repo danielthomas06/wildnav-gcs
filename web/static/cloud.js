@@ -17,6 +17,8 @@ const S = {
   plan: {                  // waypoints picked on the map, not yet launched
     waypoints: [],          // [[lat, lon]]
     mode: 'safety',
+    pinMode: 'waypoint',    // 'waypoint' | 'start' — which pin the next map click drops
+    approxStart: null,      // [lat, lon] | null
   },
   availableMaps: [],       // filenames pre-staged on the Jetson (uploaded over local WiFi)
   activeMap: null,         // which one is currently selected for the next launch
@@ -35,7 +37,7 @@ const NAV_MODES = [
 ];
 
 /* ---------- map ---------- */
-const M = { map: null, waypoints: null, trail: null, trailPts: [], gps: null, ekf: null };
+const M = { map: null, waypoints: null, trail: null, trailPts: [], gps: null, ekf: null, approxStart: null };
 
 function initMap() {
   if (M.map) return;
@@ -48,6 +50,8 @@ function initMap() {
   M.trail = L.polyline([], { color: '#f0a830', weight: 2, opacity: 0.7 }).addTo(M.map);
   M.gps = L.circleMarker([0, 0], { radius: 6, color: '#35e08a', fillColor: '#35e08a', fillOpacity: 1 });
   M.ekf = L.circleMarker([0, 0], { radius: 6, color: '#f0a830', fillColor: '#f0a830', fillOpacity: 1 });
+  M.approxStart = L.circleMarker([0, 0], { radius: 10, color: '#1a1204', weight: 2, fillColor: '#f0a830', fillOpacity: 1 })
+    .bindTooltip('S', { permanent: true, direction: 'center', className: 'wp-label' });
   // Same map, dual purpose: no mission active -> click to plan waypoints;
   // once one's confirmed running, clicks are ignored (see onMapClickForPlanning)
   // so you can't confuse "picked but not sent" with "actually flying".
@@ -61,6 +65,7 @@ function resetMap() {
   M.trail.setLatLngs([]);
   M.map.removeLayer(M.gps);
   M.map.removeLayer(M.ekf);
+  M.map.removeLayer(M.approxStart);
 }
 
 // Shared by both the "confirmed by drone" mission view and the "picked but
@@ -84,11 +89,43 @@ function renderMission(m) {
   drawWaypointsOnMap((m.waypoints || []).map(([lat, lon]) => [lat, lon]));
 }
 
-/* ---------- mission planning: click the map to add waypoints ---------- */
+/* ---------- mission planning: click the map to add waypoints or set approx start ---------- */
 function onMapClickForPlanning(e) {
   if (S.missionActive) return; // don't let clicks during a live mission look like a route change
+  if (S.plan.pinMode === 'start') {
+    S.plan.approxStart = [e.latlng.lat, e.latlng.lng];
+    renderPlanApproxStart();
+    return;
+  }
   S.plan.waypoints.push([e.latlng.lat, e.latlng.lng]);
   renderPlanWaypoints();
+}
+
+function setPlanPinMode(mode) {
+  S.plan.pinMode = mode;
+  document.getElementById('cloudPinModeBtn').classList.toggle('active', mode === 'waypoint');
+  document.getElementById('cloudStartModeBtn').classList.toggle('active', mode === 'start');
+}
+
+function renderPlanApproxStart() {
+  const row = document.getElementById('cloudApproxStartRow');
+  const text = document.getElementById('cloudApproxStartText');
+  if (!row || !text || !M.map) return;
+  if (!S.plan.approxStart) {
+    row.classList.add('hidden');
+    M.map.removeLayer(M.approxStart);
+    return;
+  }
+  const [lat, lon] = S.plan.approxStart;
+  text.textContent = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+  row.classList.remove('hidden');
+  M.approxStart.setLatLng([lat, lon]);
+  if (!M.map.hasLayer(M.approxStart)) M.approxStart.addTo(M.map);
+}
+
+function clearPlanApproxStart() {
+  S.plan.approxStart = null;
+  renderPlanApproxStart();
 }
 
 function canLaunch() {
@@ -122,6 +159,17 @@ function renderPlanModes() {
 function selectPlanMode(name) {
   S.plan.mode = name;
   renderPlanModes();
+  updateStartPinGating();
+}
+
+// Approx-start pin only meaningful when the mode seeds from vision, not GPS.
+function updateStartPinGating() {
+  const m = NAV_MODES.find(x => x.name === S.plan.mode);
+  const startBtn = document.getElementById('cloudStartModeBtn');
+  if (!m || !startBtn) return;
+  startBtn.style.opacity = m.seed_from_gps ? '.4' : '1';
+  startBtn.style.pointerEvents = m.seed_from_gps ? 'none' : 'auto';
+  if (m.seed_from_gps && S.plan.pinMode === 'start') setPlanPinMode('waypoint');
 }
 
 function updatePlanControlsEnabled() {
@@ -145,7 +193,7 @@ async function launchFromCloud() {
     takeoff_alt: parseFloat(document.getElementById('planAlt').value),
     nav_speed: parseFloat(document.getElementById('planSpeed').value),
     min_valid_alt_m: parseFloat(document.getElementById('planMinAlt').value),
-    approx_start: null,
+    approx_start: S.plan.approxStart || null,
   };
   const btn = document.getElementById('planLaunchBtn');
   btn.disabled = true;
@@ -272,6 +320,7 @@ function connectBroker() {
     document.getElementById('stageLive').classList.remove('hidden');
     initMap();
     renderPlanModes();
+    updateStartPinGating();
     updatePlanControlsEnabled();
     setTimeout(() => M.map && M.map.invalidateSize(), 50); // container was display:none at init
   });
@@ -400,6 +449,8 @@ function selectDrone(id) {
   setTel('telLatency', '—');
   resetMap();
   S.plan.waypoints = [];
+  S.plan.approxStart = null;
+  setPlanPinMode('waypoint');
   S.missionActive = false;
   const cachedMaps = S.mapsByDrone.get(id);
   S.availableMaps = cachedMaps ? (cachedMaps.files || []) : [];
