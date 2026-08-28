@@ -484,6 +484,24 @@ async def upload_map(file: UploadFile = File(...)):
     dest = UPLOAD_DIR / file.filename
     data = await file.read()
     dest.write_bytes(data)
+    result = _validate_and_activate_map(dest, file.filename)
+    if not result["ok"]:
+        # A fresh bad upload gets dropped and clears the active map — unlike
+        # _do_select_map re-validating an already-known-good pre-staged file,
+        # here there's nothing worth keeping around.
+        try: dest.unlink()
+        except Exception: pass
+        UPLOADED_TIF = None
+        return JSONResponse(result, status_code=400)
+    _publish_maps_list()
+    return result
+
+
+def _validate_and_activate_map(dest: Path, orig_filename: str) -> dict:
+    """Shared by /api/upload_map (a just-written file) and _do_select_map
+    (an already-pre-staged file) — same rasterio validation, same
+    UPLOADED_TIF activation, same response shape either way."""
+    global UPLOADED_TIF
 
     try:
         import rasterio
@@ -491,9 +509,7 @@ async def upload_map(file: UploadFile = File(...)):
         from rasterio.enums import Resampling
         import numpy as np
     except Exception as e:
-        return JSONResponse(
-            {"ok": False, "error": f"server missing rasterio/numpy: {e}"},
-            status_code=500)
+        return {"ok": False, "error": f"server missing rasterio/numpy: {e}"}
 
     preview_url = None
     try:
@@ -543,35 +559,56 @@ async def upload_map(file: UploadFile = File(...)):
                 # PNG preview is optional; picking still works via the graticule.
                 preview_url = None
     except ValueError as ex:
-        # Bad upload — drop it and report inline.
-        try: dest.unlink()
-        except Exception: pass
-        UPLOADED_TIF = None
-        return JSONResponse(
-            {"ok": False,
-             "error": f"invalid map: {ex}. Upload a georeferenced GeoTIFF."},
-            status_code=400)
+        # Invalid file — validation-only here, doesn't touch UPLOADED_TIF or
+        # delete anything; the caller decides what "bad" means for its own
+        # context (a fresh upload vs. re-validating an already-stored file).
+        return {"ok": False,
+                "error": f"invalid map: {ex}. Upload a georeferenced GeoTIFF."}
     except Exception as ex:
-        try: dest.unlink()
-        except Exception: pass
-        UPLOADED_TIF = None
-        return JSONResponse(
-            {"ok": False, "error": f"could not read map: {ex}"},
-            status_code=400)
+        return {"ok": False, "error": f"could not read map: {ex}"}
 
     UPLOADED_TIF = str(dest)
     # Corner mapping for the GUI: top-left = (n, w), bottom-right = (s, e).
     return {
         "ok": True,
         "path": str(dest),
-        "filename": file.filename,
-        "size": len(data),
+        "filename": orig_filename,
+        "size": dest.stat().st_size,
         "crs": crs_str,
         "width_px": width_px,
         "height_px": height_px,
         "bounds": {"tlLat": n, "tlLon": w, "brLat": s, "brLon": e},
         "preview_url": preview_url,
     }
+
+
+def _do_select_map(filename: str):
+    """Activate an already-uploaded (pre-staged over local WiFi) GeoTIFF by
+    filename, without re-uploading it — the cloud command version of picking
+    a map. Same validation as a fresh upload; on failure, the previously
+    active map (if any) is left untouched rather than cleared."""
+    if not filename:
+        return False, "no filename provided"
+    dest = UPLOAD_DIR / filename
+    if not dest.is_file():
+        return False, f"no such pre-staged map: {filename}"
+    result = _validate_and_activate_map(dest, filename)
+    if not result["ok"]:
+        return False, result["error"]
+    _publish_maps_list()
+    return True, f"active map set to {filename}"
+
+
+def _publish_maps_list():
+    """Retained topic (see cloud_relay.py) so a dashboard connecting after
+    the fact immediately sees what's pre-staged, same pattern as status/
+    lwt/mission — not a live-only event."""
+    files = sorted(p.name for p in UPLOAD_DIR.glob("*.tif")) + \
+            sorted(p.name for p in UPLOAD_DIR.glob("*.tiff"))
+    active = Path(UPLOADED_TIF).name if UPLOADED_TIF else None
+    event_bus.bus.publish({
+        "kind": "maps_list", "files": files, "active": active, "ts": time.time(),
+    })
 
 
 @app.post("/api/start")
@@ -591,21 +628,27 @@ async def start(payload: dict):
     The map is NOT in the payload — it's the GeoTIFF uploaded via /api/upload_map,
     whose server-side path we inject here as tif_path. No map -> no launch.
     """
+    ok, msg = _do_start_mission(payload)
+    if not ok:
+        return JSONResponse({"ok": False, "error": msg}, status_code=400)
+    return {"ok": True, "message": msg}
+
+
+def _do_start_mission(payload: dict):
+    """Shared by /api/start (local WiFi) and the cloud cmd handler (see
+    cloud_relay.py) — same validation, same RUNNER, same mission_config
+    broadcast, regardless of which transport the command arrived on.
+    Returns (ok, message_or_error)."""
     if UPLOADED_TIF is None:
-        return JSONResponse(
-            {"ok": False, "error": "no map uploaded — upload a GeoTIFF first"},
-            status_code=400)
+        return False, "no map uploaded — upload a GeoTIFF first"
     if not payload.get("waypoints"):
-        return JSONResponse({"ok": False, "error": "no waypoints provided"},
-                            status_code=400)
+        return False, "no waypoints provided"
     if payload.get("mode") not in VALID_MODES:
-        return JSONResponse({"ok": False,
-                             "error": f"mode must be one of {VALID_MODES}"},
-                            status_code=400)
+        return False, f"mode must be one of {VALID_MODES}"
     try:
         payload = prepare_mission_payload(payload)
     except ValueError as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+        return False, str(e)
     # Inject the uploaded map as the localisation TIF.
     payload["tif_path"] = UPLOADED_TIF
     ok, msg = RUNNER.start(payload)
@@ -621,13 +664,55 @@ async def start(payload: dict):
             "takeoff_alt": payload.get("takeoff_alt"),
             "ts": time.time(),
         })
-    return {"ok": ok, "message": msg}
+    return ok, msg
 
 
 @app.post("/api/stop")
 async def stop():
+    ok, msg = _do_stop_mission()
+    return {"ok": ok, "message": msg}
+
+
+def _do_stop_mission():
+    """Shared by /api/stop and the cloud cmd handler."""
     RUNNER.abort()
-    return {"ok": True, "message": "abort signal sent -> LOITER/LAND"}
+    return True, "abort signal sent -> LOITER/LAND"
+
+
+def _handle_cloud_cmd(action: str, params: dict):
+    """Callback passed into cloud_relay.relay.start() — invoked when a
+    wildnav/<id>/cmd message arrives. Same RUNNER calls as the local HTTP
+    API, just a different transport in. Returns (ok, message)."""
+    if action == "start_mission":
+        return _do_start_mission(params or {})
+    if action == "stop":
+        return _do_stop_mission()
+    if action == "select_map":
+        return _do_select_map((params or {}).get("filename"))
+    return False, f"unknown action: {action}"
+
+
+@app.get("/api/cloud_status")
+def cloud_status():
+    """No secrets — just enough for the local UI to gate the cloud-mode
+    toggle on cloud_relay actually being connected right now."""
+    return {
+        "enabled": bool(os.environ.get("WILDNAV_MQTT_HOST")),
+        "connected": cloud_relay.relay.is_connected(),
+    }
+
+
+@app.get("/api/cloud_config")
+def cloud_config():
+    """Host/port only — never credentials. Lets the local UI pre-fill the
+    broker connect form instead of the operator retyping the host every
+    time; they still enter their own operator credential client-side."""
+    return {
+        "host": os.environ.get("WILDNAV_MQTT_HOST", ""),
+        "ws_port": os.environ.get("WILDNAV_MQTT_WS_PORT", "8884"),
+        "path": os.environ.get("WILDNAV_MQTT_WS_PATH", "/mqtt"),
+        "drone_id": os.environ.get("WILDNAV_DRONE_ID", DRONE_NAME),
+    }
 
 
 # ── Device settings ───────────────────────────────────────────────────────────
@@ -727,7 +812,10 @@ async def _event_pump():
 async def _on_startup():
     asyncio.create_task(_event_pump())
     # No-ops unless WILDNAV_MQTT_HOST is set — see cloud_relay.py.
-    cloud_relay.relay.start(DRONE_NAME)
+    cloud_relay.relay.start(DRONE_NAME, on_cmd=_handle_cloud_cmd)
+    # So a dashboard connecting right after a restart sees pre-staged maps
+    # immediately (retained topic), not just ones uploaded during this run.
+    _publish_maps_list()
 
 
 @app.on_event("shutdown")

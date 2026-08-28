@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>WildNav — Mission Control</title>
 <link rel="stylesheet" href="/static/app.css">
+<script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
 </head>
 <body>
 <div id="app">
@@ -101,10 +102,61 @@
     </div>
   </section>
 
-  <!-- ============ STAGE 2: MISSION CONFIG ============ -->
-  <section class="stage hidden" id="stageConfig">
+  <!-- ============ STAGE 2: CONNECTION MODE ============ -->
+  <section class="stage hidden" id="stageConnMode">
     <div class="stage-head">
       <div class="stage-num">02</div>
+      <div>
+        <h2>Connection mode — <span class="drone-tag" id="connModeDroneName">drone</span></h2>
+        <p>Choose how commands and telemetry travel for this session.</p>
+      </div>
+    </div>
+
+    <div class="mode-cards" id="connModeCards">
+      <div class="mode-card active" id="connModeWifiCard" onclick="chooseConnMode('wifi')">
+        <div class="mc-name">Local WiFi</div>
+        <div class="mc-flags"><span class="mc-flag on">SAME NETWORK</span></div>
+      </div>
+      <div class="mode-card" id="connModeCloudCard" onclick="chooseConnMode('cloud')">
+        <div class="mc-name">Cloud (5G)</div>
+        <div class="mc-flags"><span class="mc-flag off">NEEDS INTERNET</span></div>
+      </div>
+    </div>
+    <div class="mode-explain" id="connModeExplain">
+      Commands and telemetry use the local network directly — fastest, but only works while you're on the drone's WiFi.
+    </div>
+
+    <div class="settings-grid hidden" id="cloudConnPanel" style="margin-top:18px">
+      <div class="panel">
+        <div class="panel-title">Broker</div>
+        <div class="set-row"><input id="ccHost" placeholder="broker host" disabled></div>
+        <div class="set-row">
+          <input id="ccPort" placeholder="port" style="max-width:100px" disabled>
+          <input id="ccPath" placeholder="path" style="max-width:120px" disabled>
+        </div>
+        <div class="set-note" id="cloudLinkNote">Checking the drone's own cloud connection…</div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Operator credentials</div>
+        <div class="set-row"><input id="ccUser" placeholder="username" autocomplete="off"></div>
+        <div class="set-row"><input id="ccPass" type="password" placeholder="password" autocomplete="off"></div>
+        <div class="set-row">
+          <button class="btn ghost sm" onclick="connectCloud()">Connect</button>
+          <span id="cloudConnStatus" class="set-inline">not connected</span>
+        </div>
+        <div class="set-note">Needs publish rights on <code>wildnav/&lt;id&gt;/cmd</code> — a different credential than the read-only dashboard one.</div>
+      </div>
+    </div>
+
+    <button class="btn launch" id="connModeContinueBtn" style="margin-top:18px" onclick="confirmConnMode()">
+      Continue →
+    </button>
+  </section>
+
+  <!-- ============ STAGE 3: MISSION CONFIG ============ -->
+  <section class="stage hidden" id="stageConfig">
+    <div class="stage-head">
+      <div class="stage-num">03</div>
       <div>
         <h2>Plan mission — <span class="drone-tag" id="cfgDroneName">drone</span></h2>
         <p>Upload a reference map, drop waypoints, choose a mode, and launch.</p>
@@ -196,7 +248,7 @@
     </div>
   </section>
 
-  <!-- ============ STAGE 3: LIVE MISSION ============ -->
+  <!-- ============ STAGE 4: LIVE MISSION ============ -->
   <section class="stage hidden" id="stageLive">
     <div class="stage-head">
       <div class="stage-num live-num">●</div>

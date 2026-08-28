@@ -4,8 +4,11 @@ cloud_relay.py — ships the same events the local WebSocket already shows
 stdout/stderr to a cloud MQTT broker, so they're visible on a dashboard
 from anywhere, without local WiFi range or an SSH session.
 
-Monitoring only (v1) — see cloud_relay/DESIGN.md. Nothing subscribes to a
-command topic in this version; the drone accepts no input from the cloud.
+Also accepts commands (start_mission/stop) on wildnav/<id>/cmd, acked on
+wildnav/<id>/cmd_ack — but only if start() is given an on_cmd callback; the
+drone_agent.py call site is the only place that wires one up. Passing none
+(or just never calling start() with one) keeps a deployment monitoring-only,
+same as v1 — see cloud_relay/DESIGN.md §6.
 
 Safe by default: if WILDNAV_MQTT_HOST isn't set, start() no-ops and prints
 one line. Existing local-only deployments are unaffected either way, and
@@ -32,6 +35,9 @@ TOPIC_EVENTS = "wildnav/{id}/events"
 TOPIC_STATUS = "wildnav/{id}/status"
 TOPIC_LWT = "wildnav/{id}/lwt"
 TOPIC_MISSION = "wildnav/{id}/mission"
+TOPIC_CMD = "wildnav/{id}/cmd"
+TOPIC_CMD_ACK = "wildnav/{id}/cmd_ack"
+TOPIC_MAPS = "wildnav/{id}/maps"
 
 _HEARTBEAT_PERIOD_S = 0.2  # 5 Hz
 
@@ -101,12 +107,20 @@ class CloudRelay:
         self._sub_q = None
         self._drone_id = None
         self._seq = 0
+        self._on_cmd = None
 
     def _next_seq(self):
         self._seq += 1
         return self._seq
 
-    def start(self, drone_id: str):
+    def is_connected(self) -> bool:
+        return bool(self._client and self._client.is_connected())
+
+    def start(self, drone_id: str, on_cmd=None):
+        """on_cmd(action, params) -> (ok, message) — called synchronously
+        when a wildnav/<id>/cmd message arrives. Monitoring-only if omitted
+        (no subscribe happens at all — see _make_on_connect)."""
+        self._on_cmd = on_cmd
         host = os.environ.get("WILDNAV_MQTT_HOST")
         if not host:
             print("[cloud_relay] WILDNAV_MQTT_HOST not set — cloud relay disabled")
@@ -193,7 +207,41 @@ class CloudRelay:
             # if we ever drop off uncleanly again.
             lwt_topic = TOPIC_LWT.format(id=self._drone_id)
             client.publish(lwt_topic, payload, qos=1, retain=True)
+            # Monitoring-only deployments (no on_cmd passed to start()) never
+            # subscribe to anything — the drone accepts no input from the
+            # cloud unless the caller explicitly wired up a command handler.
+            if self._on_cmd is not None:
+                cmd_topic = TOPIC_CMD.format(id=self._drone_id)
+                client.subscribe(cmd_topic, qos=1)
+                client.message_callback_add(cmd_topic, self._on_cmd_message)
         return _on_connect
+
+    def _on_cmd_message(self, client, userdata, msg):
+        ack_topic = TOPIC_CMD_ACK.format(id=self._drone_id)
+
+        def ack(cmd_id, status, detail=""):
+            try:
+                client.publish(ack_topic, json.dumps({
+                    "cmd_id": cmd_id, "status": status, "detail": detail,
+                    "ts": time.time(),
+                }, default=_json_default), qos=1)
+            except Exception:
+                pass
+
+        try:
+            cmd = json.loads(msg.payload)
+        except Exception as e:
+            print(f"[cloud_relay] dropped malformed cmd message: {e}")
+            return
+        cmd_id = cmd.get("cmd_id")
+        action = cmd.get("action")
+        print(f"[cloud_relay] cmd received: {action} (cmd_id={cmd_id})")
+        ack(cmd_id, "received")
+        try:
+            ok, message = self._on_cmd(action, cmd.get("params") or {})
+        except Exception as e:
+            ok, message = False, f"handler raised: {e}"
+        ack(cmd_id, "done" if ok else "rejected", message)
 
     def _make_on_log(self):
         import paho.mqtt.client as mqtt
@@ -252,6 +300,16 @@ class CloudRelay:
                 mission_topic = TOPIC_MISSION.format(id=self._drone_id)
                 try:
                     self._client.publish(mission_topic,
+                                          json.dumps(event, default=_json_default),
+                                          qos=1, retain=True)
+                except Exception:
+                    pass
+            if event.get("kind") == "maps_list":
+                # Same retained pattern: a dashboard connecting later should
+                # see what's pre-staged without waiting for a new upload.
+                maps_topic = TOPIC_MAPS.format(id=self._drone_id)
+                try:
+                    self._client.publish(maps_topic,
                                           json.dumps(event, default=_json_default),
                                           qos=1, retain=True)
                 except Exception:

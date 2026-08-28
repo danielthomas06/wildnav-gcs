@@ -80,7 +80,7 @@ through a broker both sides dial out to. This rules out exposing
 |---|---|---|
 | Broker | HiveMQ Cloud free tier by default; AWS IoT Core supported as a pluggable alternative | `cloud_relay.py` is a plain MQTT/TLS client — broker choice is a config value, not an architecture change. Default wins on cost; AWS is there for teams already on AWS |
 | Scope (full design) | Telemetry **and** full command/control over cloud | Operator needs to issue STOP/LOITER/RTL mid-flight, not just observe |
-| **Scope (v1 implementation)** | **Monitoring only: telemetry + terminal/log output.** Command channel (§6) is designed but deferred to v2 | Get the one-way pipeline flowing and proven reliable before adding a safety-critical command path |
+| **Scope (v1 implementation)** | Monitoring only: telemetry + terminal/log output. **Superseded** — command channel (§6) built once the monitoring path was proven reliable | Deliberate sequencing: get the one-way pipeline flowing and trusted first, only then add a safety-critical command path |
 | History | Live only, no persistence (v1) | Simplest MVP; broker fans out live data directly, no DB needed yet |
 | Fleet size target | 1-3 drones | Sizes the broker tier and topic design; revisit if scaling to a fleet |
 | Link-loss policy | Mission continues autonomously; no cloud-triggered auto-RTL | Explicit choice — the flight controller's own failsafes (battery, geofence) remain the backstop underneath this layer regardless |
@@ -109,6 +109,9 @@ wildnav/<drone_id>/events   QoS1, retained=false   — telemetry + all log/event
 wildnav/<drone_id>/status   QoS1, retained=true    — periodic heartbeat, 5Hz
 wildnav/<drone_id>/lwt      retained                — broker-set offline marker
 wildnav/<drone_id>/mission  QoS1, retained=true    — waypoints + mode for the active mission
+wildnav/<drone_id>/cmd      QoS1, retained=false   — ground → drone: start_mission | stop (§6)
+wildnav/<drone_id>/cmd_ack  QoS1, retained=false   — drone → ground: received | done | rejected
+wildnav/<drone_id>/maps     QoS1, retained=true    — pre-staged GeoTIFFs + which one is active (§6.1)
 ```
 
 **This differs from the original speculative schema above** (§5.3 previously
@@ -172,49 +175,158 @@ isn't:**
 No `seq`/`ts` gap detection or protobuf/msgpack needed yet — payloads are
 still small, single-digit Hz.
 
-## 6. Command & control design
+## 6. Command & control design — implemented
 
-Because commands now control the aircraft mid-flight, this channel is
-safety-critical — a lost STOP or a spoofed RTL both being real risk. Two
-topics keep "sent" and "confirmed" distinct:
+Built as a second transport option in the *same* local UI (`web/index.html`),
+not a separate app — see §13. A new "Connection mode" step lets the operator
+pick **Local WiFi** (unchanged — `/api/start`, `/api/stop`) or **Cloud (5G)**
+(commands go over MQTT instead). Two topics keep "sent" and "confirmed"
+distinct, as originally designed:
 
-**`cmd`** (ground → drone)
+**`cmd`** (ground → drone), QoS1, retained=false
 ```json
 {
-  "cmd_id": "c-000123",
-  "ts": "2026-08-08T10:16:01.000Z",
-  "action": "RTL",
-  "issued_by": "operator@dashboard"
+  "cmd_id": "cmd-1787655805882-eb6521",
+  "action": "start_mission",
+  "params": { "waypoints": [[17.5, 78.5]], "mode": "safety", "takeoff_alt": 120.0 },
+  "ts": 1787655805.88
 }
 ```
+`action` is `start_mission` or `stop`. `params` for `start_mission` is
+exactly the same payload shape `/api/start` already accepts — same
+validation, same `RUNNER.start()` call, same `mission_config` broadcast (§5).
+There is no separate command language to maintain.
 
-**`cmd_ack`** (drone → ground)
+**`cmd_ack`** (drone → ground), QoS1, retained=false
 ```json
-{
-  "cmd_id": "c-000123",
-  "ts": "2026-08-08T10:16:01.310Z",
-  "status": "done",
-  "detail": "RTL engaged"
-}
+{ "cmd_id": "cmd-1787655805882-eb6521", "status": "done", "detail": "mission started", "ts": 1787655806.02 }
 ```
-`status` is one of `received | executing | done | rejected`.
+`status` is `received | done | rejected`.
 
-Design rules:
-- **Ack loop is mandatory.** MQTT QoS only guarantees broker↔client
-  delivery, not that `flight_engine.py` executed the command. The dashboard
-  shows a command as *pending* until `cmd_ack` arrives, and flags it if no
-  ack lands within ~2-3s (a healthy round trip is well under 500ms).
-- **Sequencing & staleness.** Every command carries `cmd_id` + `ts`. The
-  drone ignores a command older than the last one it already applied —
-  prevents a command queued during a dropped session from firing late and
-  overriding a newer instruction.
-- **Safety commands are the exception to staleness.** STOP / LOITER / RTL
-  are idempotent and always honored even if delayed — worst case is a
-  redundant safe action, never a harmful one.
-- **Latency expectation:** this is a supervisory link (discrete state
-  changes), not manual control. Typical round trip (5G up + broker + 5G
-  down) is ~100-300ms on good coverage, up to 1-2s on poor coverage — never
-  intended to carry raw stick input.
+What's actually implemented (simpler than the original v1 sketch above, on
+purpose — see the rationale for each simplification):
+- **Ack loop**: yes, as designed. `cloud_relay.py` acks `received`
+  immediately, then `done`/`rejected` once `RUNNER.start()`/`RUNNER.abort()`
+  returns (both are non-blocking calls, so this is fast — the UI times out
+  and reports a failure if no ack arrives within 5s).
+- **Sequencing/staleness**: skipped, deliberately. Both actions are already
+  naturally idempotent — `RUNNER.start()` refuses a second start while a
+  mission is active, `RUNNER.abort()` is a no-op if already aborted — so a
+  duplicate or delayed QoS1 redelivery can't cause harm without extra
+  bookkeeping. Revisit if LOITER/RTL (non-idempotent by nature) get added.
+- **`issued_by`**: skipped for v1 — auth is per-credential at the broker
+  (see below), not per-message.
+- **Command handler dispatch**: `cloud_relay.py` is still transport-only —
+  it takes an `on_cmd(action, params) -> (ok, message)` callback from
+  whoever calls `start()`. `drone_agent.py` passes `_handle_cloud_cmd`,
+  which routes to the *exact same* `_do_start_mission()`/`_do_stop_mission()`
+  functions the local HTTP handlers call — one source of truth for mission
+  logic regardless of which transport a command arrived on.
+
+**Credentials — one more is needed** beyond the two from §10:
+- `drone-alpha-publisher` (existing) needs one addition: **subscribe** on
+  its own `wildnav/<id>/cmd` (it already publishes everywhere else).
+- **New**: an operator command credential (`operator-cmd`) — needs
+  **publish** on `wildnav/<id>/cmd` and **subscribe** on
+  `status`/`lwt`/`events`/`cmd_ack`. Deliberately *not* the same credential
+  as `dashboard-readonly` (§10), which stays publish-nothing — that
+  separation matters more now that `operator-cmd` is also used from a public
+  Netlify page (§6.1), not just the local UI: it scopes the blast radius of
+  a leaked credential to "can command this drone" rather than conflating it
+  with the URL-is-basically-public read-only view.
+
+**Latency**: not yet measured for commands specifically (see the live
+`LATENCY` card on the dashboard for telemetry latency, §12) — the same
+broker+WAN path applies, so expect a similar range in practice.
+
+### 6.1 Launch from anywhere (Netlify), not just local WiFi
+
+Originally `dashboard/` (and its local-WiFi twin `web/cloud.html`) were
+view-only — mission planning lived exclusively in `web/index.html`, which
+you can only load from the drone's own WiFi. That meant "launch over 5G"
+still required standing next to the drone once to load the control page,
+even though the *command* itself already traveled over the cloud path.
+
+**One constraint shaped the fix — refined once, worth being precise about
+it.** The mission GeoTIFF is uploaded via `/api/upload_map`, processed
+server-side on the Jetson with `rasterio` — a plain-HTTP local endpoint a
+Netlify (HTTPS) page can never reach directly (mixed content). That part's a
+real, permanent wall. But it's *not* actually a wall against uploading a
+GeoTIFF from anywhere in general — the cloud/MQTT path (already used for
+everything else) isn't HTTP and isn't subject to mixed content at all.
+
+The reason map upload still requires local WiFi is a **different, chosen**
+constraint: HiveMQ Cloud's free tier caps a single MQTT message at 5MB, and
+a real mission GeoTIFF is usually bigger than that — so shipping one over
+MQTT would need chunking (split, sequence, reassemble, verify — a genuinely
+new protocol piece, nothing else here does this), plus it'd eat real
+traffic budget, plus a large transfer over actual field 5G can be slow/flaky
+on a weak signal. Given that, the deliberate choice (§6.2) is: **pre-stage
+maps over WiFi ahead of time, select among them remotely** — not "can't
+upload a GeoTIFF over the cloud," but "chose not to, for good reasons."
+
+What *doesn't* need the actual GeoTIFF, though, is picking waypoints —
+that's just lat/lon math. So the map panel already built for live tracking
+(§ map panel note in §12) became dual-purpose:
+- **No mission active**: clicking the map adds a waypoint (real satellite
+  imagery via the same Leaflet/Esri layer, not the mission's rectified
+  GeoTIFF — good enough for picking real-world coordinates, not pixel-exact
+  to what the drone localizes against).
+- **Mission confirmed active** (`mission_config` received): same layer
+  group switches to showing the live GPS/EKF position instead, and further
+  map clicks are ignored — so a stray click can't look like a route change
+  mid-flight.
+
+`web/index.html`'s mode list (`/api/info`) isn't reachable from Netlify
+either, so `dashboard/static/cloud.js` carries a small fixed duplicate
+(`NAV_MODES`) instead of fetching it live — worth updating in both places if
+`nav_modes.py`'s mode set ever changes.
+
+**Security tradeoff, made deliberately, not by default**: this puts real
+command authority behind a public URL, gated by the `operator-cmd`
+credential alone (no additional app-level password layer) — a conscious
+choice to keep the credential as the only gate, matching the local page's
+model, with the understanding that the password should be rotated if ever
+suspected leaked.
+
+### 6.2 Map pre-staging — select a remote map without transferring it
+
+Storage already supported this for free: `/api/upload_map` writes each
+upload to `UPLOAD_DIR` under its own original filename rather than
+overwriting a fixed name, so multiple GeoTIFFs already coexist there once
+uploaded (over WiFi, as always) — no new storage layer needed, just a way to
+list and pick among what's already sitting on the Jetson.
+
+- `_validate_and_activate_map(dest, filename)` — the actual rasterio
+  validation, extracted out of `/api/upload_map` so it's shared with...
+- `_do_select_map(filename)` — re-validates an *already-staged* file and
+  activates it (`UPLOADED_TIF`), without touching anything if it fails
+  (unlike a bad fresh upload, which still clears the active map and deletes
+  itself — different failure semantics for a good reason: re-selecting
+  shouldn't be able to destroy a previously-working map).
+- New cloud command action: `select_map`, `params: {filename}` — routed
+  through `_handle_cloud_cmd` next to `start_mission`/`stop`, same ack
+  pattern.
+- `wildnav/<id>/maps` (retained) carries `{files: [...], active: "..."}`,
+  published on upload, on successful `select_map`, and once at agent
+  startup (so a dashboard connecting after a restart sees the real current
+  list, not just what changed during this run).
+
+Dashboard side: a `<select>` in the Plan & launch panel populated from this
+topic; picking one sends `select_map` and waits for the ack, same
+pending/confirmed pattern as launch. Launch itself is now gated on three
+things together (`canLaunch()`): waypoints picked, no mission already
+active, **and** a map actually selected — matching `S.mapReady` gating on
+the local page, just sourced from the cloud instead of a direct upload
+response.
+
+Verified end-to-end against a live broker: `maps_list` retained-delivery to
+a late subscriber, `select_map` round trip updating the active map and
+re-publishing the list, and the three-way launch gate in the browser.
+
+Verified end-to-end against a live broker: pick waypoints on the map →
+Start mission → ack confirms → map seamlessly shows the same waypoints as
+"active" → STOP → ack confirms → controls re-enable for the next mission.
 
 ## 7. Reliability & failure handling
 
@@ -361,10 +473,48 @@ watchdog), and a DNS resolution problem specific to the deployment network
 **Config** (env vars read by `cloud_relay.py`, unset = disabled):
 `WILDNAV_MQTT_HOST`, `WILDNAV_MQTT_PORT` (default 8883), `WILDNAV_MQTT_USERNAME`,
 `WILDNAV_MQTT_PASSWORD`, `WILDNAV_DRONE_ID` (defaults to the agent's `--name`).
+Local UI's cloud mode also reads `WILDNAV_MQTT_WS_PORT` (default 8884) and
+`WILDNAV_MQTT_WS_PATH` (default `/mqtt`) via `/api/cloud_config` — the
+WebSocket port a browser needs, separate from the raw MQTT port
+`cloud_relay.py` itself uses.
+
+**Command channel (§6) — built, no longer deferred.** `web/index.html` +
+`web/static/app.js` now have a connection-mode step (Local WiFi / Cloud);
+`server/cloud_relay.py` accepts an `on_cmd` callback and subscribes to
+`cmd` only when one is supplied; `server/drone_agent.py` wires
+`_handle_cloud_cmd` in, dispatching to the same `_do_start_mission()` /
+`_do_stop_mission()` functions the local HTTP API uses. Verified end-to-end
+against a live broker: malformed/invalid commands, double-start guarding,
+stop, unknown actions — all producing the correct `received → done/rejected`
+ack sequence — plus a full browser test (real MQTT-over-WSS from a page,
+real command dispatch, real ack round trip, correct UI state transitions)
+before this was called done.
+
+**Launch from anywhere (§6.1) — built.** `dashboard/index.html` +
+`dashboard/static/cloud.js` (and the local-WiFi twin `web/cloud.html` +
+`web/static/cloud.js`, kept identical) gained a "Plan & launch" panel —
+mode/params controls, and the existing map panel now doubles as a
+click-to-add-waypoint picker before a mission starts, live-tracking view
+once one's confirmed. Reuses `sendCloudCommand`/ack handling ported from
+`app.js`. Verified end-to-end against a live broker: pick waypoints on the
+map, launch, confirm via ack + `mission_config`, map handoff from
+"planned" to "confirmed" markers, stop, controls re-enable.
+
+**Map pre-staging (§6.2) — built.** `select_map` cloud command +
+`wildnav/<id>/maps` retained topic; upload logic in `drone_agent.py`
+refactored so a fresh upload and re-selecting an already-staged file share
+the same validation, with different (correct) failure semantics for each.
+Launch gating extended to require an active map, not just waypoints.
+Verified end-to-end: retained delivery, select round trip, three-way gate.
 
 **Still open:**
-- Command channel (§6) — deferred to v2 per the explicit v1 scope decision.
 - Historical storage, multi-drone fleet dashboard polish — later, per §11.
 - Shipping the actual mission GeoTIFF for exact-match imagery instead of
-  generic satellite tiles — deliberately skipped, see the map panel note
-  above and the original tradeoff discussion in chat.
+  generic satellite tiles — deliberately skipped, see §6.1.
+- LOITER/RTL as additional cloud commands — only start_mission/stop exist
+  today; if added, revisit the sequencing/staleness simplification in §6
+  since those aren't naturally idempotent the way start/stop are.
+- New `operator-cmd` broker credential (§6) — needs to actually be created
+  in the HiveMQ Cloud console; not done automatically by this codebase.
+- An app-level password gate in front of the Netlify launch panel, beyond
+  the MQTT credential alone — considered and explicitly deferred (§6.1).

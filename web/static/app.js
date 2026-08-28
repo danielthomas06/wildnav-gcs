@@ -17,6 +17,13 @@ const S = {
   // SAME uploaded map is what the drone localises against, so these corners are
   // authoritative for both picking and the flight.
   geo: null,
+
+  // ---- connection mode: local WiFi (default, unchanged) vs cloud (5G) ----
+  connMode: 'wifi',          // 'wifi' | 'cloud'
+  droneId: null,             // from /api/info — matches WILDNAV_DRONE_ID
+  mqtt: null,                 // MQTT.js client, only used in cloud mode
+  cloudCfg: null,             // {host, ws_port, path, drone_id} from /api/cloud_config
+  pendingCmds: new Map(),     // cmd_id -> {resolve, reject, timeoutHandle}
 };
 
 /* ---------- boot ---------- */
@@ -32,6 +39,7 @@ async function bootstrap() {
   try {
     const info = await fetch('/api/info').then(r => r.json());
     S.modes = info.modes;
+    S.droneId = info.name;
     renderDiscoveredSelf(info);
   } catch (e) {
     document.getElementById('droneList').innerHTML =
@@ -112,9 +120,144 @@ function selectDrone(json) {
   S.drone = JSON.parse(json);
   document.getElementById('cfgDroneName').textContent = S.drone.name;
   document.getElementById('liveDroneName').textContent = S.drone.name;
-  show('stageConfig'); hide('stageDiscovery'); hide('stageSettings');
+  document.getElementById('connModeDroneName').textContent = S.drone.name;
+  show('stageConnMode'); hide('stageDiscovery'); hide('stageSettings');
   renderModes();
   if (!S.ws || S.ws.readyState !== 1) openWebSocket();
+}
+
+/* ---------- connection mode: local WiFi vs cloud (5G) ---------- */
+function chooseConnMode(mode) {
+  S.connMode = mode;
+  document.getElementById('connModeWifiCard').classList.toggle('active', mode === 'wifi');
+  document.getElementById('connModeCloudCard').classList.toggle('active', mode === 'cloud');
+  document.getElementById('cloudConnPanel').classList.toggle('hidden', mode !== 'cloud');
+  document.getElementById('connModeExplain').innerHTML = mode === 'wifi'
+    ? "Commands and telemetry use the local network directly — fastest, but only works while you're on the drone's WiFi."
+    : 'Commands and telemetry travel over the internet via the cloud broker — works from anywhere, including after you leave WiFi range.';
+  const btn = document.getElementById('connModeContinueBtn');
+  if (mode === 'wifi') {
+    btn.disabled = false;
+  } else {
+    btn.disabled = !(S.mqtt && S.mqtt.connected);
+    loadCloudConfig();
+  }
+}
+
+async function loadCloudConfig() {
+  if (!S.cloudCfg) {
+    try { S.cloudCfg = await fetch('/api/cloud_config').then(r => r.json()); }
+    catch (e) { S.cloudCfg = { host: '' }; }
+    document.getElementById('ccHost').value = S.cloudCfg.host || '(not configured)';
+    document.getElementById('ccPort').value = S.cloudCfg.ws_port || '8884';
+    document.getElementById('ccPath').value = S.cloudCfg.path || '/mqtt';
+  }
+  checkCloudLink();
+}
+
+async function checkCloudLink() {
+  const note = document.getElementById('cloudLinkNote');
+  try {
+    const st = await fetch('/api/cloud_status').then(r => r.json());
+    if (!st.enabled) {
+      note.textContent = "Cloud relay isn't configured on this drone (no WILDNAV_MQTT_HOST) — cloud mode unavailable.";
+      note.style.color = 'var(--red)';
+    } else if (!st.connected) {
+      note.textContent = 'Drone is not currently connected to the broker — check its internet connection.';
+      note.style.color = 'var(--red)';
+    } else {
+      note.textContent = 'Drone is connected to the broker ✓ — enter operator credentials below to connect this browser too.';
+      note.style.color = 'var(--phosphor)';
+    }
+  } catch (e) {
+    note.textContent = 'Could not check — the local agent is unreachable.';
+    note.style.color = 'var(--red)';
+  }
+}
+
+function connectCloud() {
+  if (!S.cloudCfg || !S.cloudCfg.host) { alert('Cloud relay is not configured on this drone.'); return; }
+  const user = document.getElementById('ccUser').value;
+  const pass = document.getElementById('ccPass').value;
+  if (S.mqtt) { try { S.mqtt.end(true); } catch (e) {} }
+
+  const statusEl = document.getElementById('cloudConnStatus');
+  statusEl.textContent = 'connecting…';
+  const url = `wss://${S.cloudCfg.host}:${S.cloudCfg.ws_port}${S.cloudCfg.path}`;
+  S.mqtt = mqtt.connect(url, {
+    username: user || undefined,
+    password: pass || undefined,
+    clientId: 'wildnav-operator-' + Math.random().toString(16).slice(2, 10),
+    clean: true,
+    reconnectPeriod: 3000,
+  });
+
+  const id = () => S.cloudCfg.drone_id || S.droneId;
+
+  S.mqtt.on('connect', () => {
+    statusEl.textContent = 'connected ✓';
+    S.mqtt.subscribe(`wildnav/${id()}/status`, { qos: 1 });
+    S.mqtt.subscribe(`wildnav/${id()}/lwt`, { qos: 1 });
+    S.mqtt.subscribe(`wildnav/${id()}/events`, { qos: 1 });
+    S.mqtt.subscribe(`wildnav/${id()}/cmd_ack`, { qos: 1 });
+    if (S.connMode === 'cloud') document.getElementById('connModeContinueBtn').disabled = false;
+  });
+  S.mqtt.on('reconnect', () => { statusEl.textContent = 'reconnecting…'; });
+  S.mqtt.on('close', () => {
+    statusEl.textContent = 'disconnected';
+    if (S.connMode === 'cloud') document.getElementById('connModeContinueBtn').disabled = true;
+  });
+  S.mqtt.on('error', (e) => { statusEl.textContent = 'error: ' + (e && e.message || e); });
+  S.mqtt.on('message', onCloudMessage);
+}
+
+function onCloudMessage(topic, payloadBuf) {
+  const sub = topic.split('/')[2];
+  let data;
+  try { data = JSON.parse(payloadBuf.toString()); } catch (e) { return; }
+  if (sub === 'status' || sub === 'lwt') {
+    setConn(data.status === 'online' ? 'live' : 'dead',
+            data.status === 'online' ? 'drone online (cloud)' : 'drone offline (cloud)');
+    return;
+  }
+  // events carries the exact same {kind: ...} shape the local WebSocket
+  // sends — handleMessage()/updateTelemetry()/routeEvent() below are
+  // transport-agnostic, no cloud-specific rendering path needed.
+  if (sub === 'events') { handleMessage(data.event || {}); return; }
+  if (sub === 'cmd_ack') { handleCmdAck(data); return; }
+}
+
+function handleCmdAck(ack) {
+  if (ack.status === 'received') {
+    logLine('setup', '» command received by drone, executing…');
+    return;
+  }
+  const pending = S.pendingCmds.get(ack.cmd_id);
+  if (!pending) return;
+  clearTimeout(pending.timeoutHandle);
+  S.pendingCmds.delete(ack.cmd_id);
+  if (ack.status === 'done') pending.resolve(ack);
+  else pending.reject(new Error(ack.detail || 'rejected'));
+}
+
+function sendCloudCommand(action, params) {
+  return new Promise((resolve, reject) => {
+    if (!S.mqtt || !S.mqtt.connected) { reject(new Error('not connected to broker')); return; }
+    const cmd_id = 'cmd-' + Date.now() + '-' + Math.random().toString(16).slice(2, 8);
+    const timeoutHandle = setTimeout(() => {
+      S.pendingCmds.delete(cmd_id);
+      reject(new Error('no response from drone within 5s'));
+    }, 5000);
+    S.pendingCmds.set(cmd_id, { resolve, reject, timeoutHandle });
+    const id = S.cloudCfg.drone_id || S.droneId;
+    S.mqtt.publish(`wildnav/${id}/cmd`, JSON.stringify({
+      cmd_id, action, params, ts: Date.now() / 1000,
+    }), { qos: 1 });
+  });
+}
+
+function confirmConnMode() {
+  hide('stageConnMode'); show('stageConfig');
 }
 
 /* ---------- stage switching ---------- */
@@ -449,6 +592,21 @@ async function launch() {
     min_valid_alt_m: parseFloat(document.getElementById('minAltInput').value),
     approx_start: S.approxStart ? [S.approxStart.lat, S.approxStart.lon] : null,
   };
+  if (S.connMode === 'cloud') {
+    const btn = document.getElementById('launchBtn');
+    btn.disabled = true; btn.innerHTML = '<span class="launch-icon">▲</span> Sending…';
+    try {
+      await sendCloudCommand('start_mission', payload);
+      hide('stageConfig'); show('stageLive');
+      logLine('ok', 'Mission command sent via cloud — confirmed by drone.');
+    } catch (e) {
+      alert('Launch failed: ' + e.message);
+    } finally {
+      btn.disabled = false; btn.innerHTML = '<span class="launch-icon">▲</span> Start mission';
+    }
+    return;
+  }
+
   const res = await fetch('/api/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -460,6 +618,15 @@ async function launch() {
 }
 
 async function stopMission() {
+  if (S.connMode === 'cloud') {
+    try {
+      await sendCloudCommand('stop', {});
+      logLine('err', 'STOP sent via cloud — confirmed by drone.');
+    } catch (e) {
+      logLine('err', 'STOP via cloud failed: ' + e.message);
+    }
+    return;
+  }
   await fetch('/api/stop', { method: 'POST' }).catch(() => {});
   logLine('err', 'STOP sent — drone commanded to LOITER/LAND.');
 }

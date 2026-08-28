@@ -34,7 +34,7 @@
       <span class="glyph">◎</span>
       <div>
         <div class="brand-name">WILDNAV</div>
-        <div class="brand-sub">cloud dashboard — view only</div>
+        <div class="brand-sub">cloud dashboard — view, plan &amp; launch</div>
       </div>
     </div>
     <div style="display:flex;align-items:center;gap:16px">
@@ -52,7 +52,7 @@
       <div class="stage-num">⚙</div>
       <div>
         <h2>Connect to broker</h2>
-        <p>Read-only dashboard credentials for the MQTT broker — saved in this browser only.</p>
+        <p>Saved in this browser only. Use <code>dashboard-readonly</code> to just watch, or a command-capable credential (e.g. <code>operator-cmd</code>) to also plan and launch missions from here.</p>
       </div>
     </div>
     <div class="settings-grid">
@@ -76,7 +76,7 @@
           <button class="btn ghost sm" onclick="connectBroker()">Connect</button>
           <button class="btn ghost sm" onclick="disconnectBroker()">Disconnect</button>
         </div>
-        <div class="set-note">Use a read-only credential scoped to subscribe on <code>wildnav/+/#</code> — never the drone's own publish credential.</div>
+        <div class="set-note">Read-only credentials can view but not launch — the Plan &amp; launch panel below will show "not connected" for commands until you use one scoped to publish on <code>cmd</code>. Never the drone's own publish credential either way.</div>
       </div>
     </div>
   </section>
@@ -90,6 +90,43 @@
         <p id="livePhase">Waiting for a drone to publish…</p>
       </div>
       <select id="dronePicker" class="btn ghost sm" style="margin-left:auto" onchange="selectDrone(this.value)"></select>
+    </div>
+
+    <!-- Plan & launch: the map above doubles as the waypoint picker until a
+         mission is confirmed active, then switches to showing live position.
+         Only works with a command-capable credential (not the read-only
+         dashboard-readonly one) — see cloud_relay/DESIGN.md §6. -->
+    <div class="panel" id="planPanel" style="margin-bottom:18px">
+      <div class="panel-title">Plan &amp; launch</div>
+      <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
+        <select id="planMapSelect" class="btn ghost sm" style="min-width:220px" onchange="selectMapRemote(this.value)">
+          <option value="">No map pre-staged — upload via local WiFi first</option>
+        </select>
+      </div>
+      <div class="mode-cards" id="planModeCards" style="margin-bottom:12px"></div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+        <div class="speed-input" style="max-width:110px">
+          <input id="planAlt" type="number" value="120" step="5" min="10" max="200">
+          <span class="unit">m alt</span>
+        </div>
+        <div class="speed-input" style="max-width:110px">
+          <input id="planSpeed" type="number" value="2.5" step="0.5" min="0.5" max="10">
+          <span class="unit">m/s</span>
+        </div>
+        <div class="speed-input" style="max-width:130px">
+          <input id="planMinAlt" type="number" value="90" step="5" min="0" max="200">
+          <span class="unit">min-alt m</span>
+        </div>
+        <span class="set-inline">Waypoints: <b id="planWpCount">0</b></span>
+        <button class="btn ghost sm" onclick="clearPlanWaypoints()">Clear</button>
+      </div>
+      <div style="display:flex;gap:12px;align-items:center;margin-top:14px">
+        <button class="btn launch" id="planLaunchBtn" onclick="launchFromCloud()" disabled>
+          <span class="launch-icon">▲</span> Start mission
+        </button>
+        <button class="btn stop" onclick="stopFromCloud()">■ STOP</button>
+        <span class="set-note" id="planNote">Click the map to add waypoints, then Start mission.</span>
+      </div>
     </div>
 
     <div class="live-grid">

@@ -12,7 +12,27 @@ const S = {
   drones: new Map(),       // drone_id -> { lastSeen, status }
   missions: new Map(),     // drone_id -> last mission_config payload (waypoints, mode, ...)
   selectedDrone: null,
+  missionActive: false,    // true once a mission_config arrives or our own launch is confirmed
+  pendingCmds: new Map(),  // cmd_id -> {resolve, reject, timeoutHandle}
+  plan: {                  // waypoints picked on the map, not yet launched
+    waypoints: [],          // [[lat, lon]]
+    mode: 'safety',
+  },
+  availableMaps: [],       // filenames pre-staged on the Jetson (uploaded over local WiFi)
+  activeMap: null,         // which one is currently selected for the next launch
+  mapsByDrone: new Map(),  // drone_id -> last maps_list payload, cached regardless of selection
 };
+
+// Same 4 modes nav_modes.py serves via /api/info on the local page — that
+// endpoint isn't reachable from here (mixed content, see DESIGN.md), so
+// this is a small fixed duplicate rather than a live fetch. Keep in sync if
+// the mode set ever changes.
+const NAV_MODES = [
+  { name: 'safety', seed_from_gps: true, gps_correction: true },
+  { name: 'cold_start', seed_from_gps: false, gps_correction: true },
+  { name: 'safe_start', seed_from_gps: true, gps_correction: false },
+  { name: 'full_gps_denied', seed_from_gps: false, gps_correction: false },
+];
 
 /* ---------- map ---------- */
 const M = { map: null, waypoints: null, trail: null, trailPts: [], gps: null, ekf: null };
@@ -28,6 +48,10 @@ function initMap() {
   M.trail = L.polyline([], { color: '#f0a830', weight: 2, opacity: 0.7 }).addTo(M.map);
   M.gps = L.circleMarker([0, 0], { radius: 6, color: '#35e08a', fillColor: '#35e08a', fillOpacity: 1 });
   M.ekf = L.circleMarker([0, 0], { radius: 6, color: '#f0a830', fillColor: '#f0a830', fillOpacity: 1 });
+  // Same map, dual purpose: no mission active -> click to plan waypoints;
+  // once one's confirmed running, clicks are ignored (see onMapClickForPlanning)
+  // so you can't confuse "picked but not sent" with "actually flying".
+  M.map.on('click', onMapClickForPlanning);
 }
 
 function resetMap() {
@@ -39,10 +63,12 @@ function resetMap() {
   M.map.removeLayer(M.ekf);
 }
 
-function renderMission(m) {
-  if (!M.map || !m) return;
+// Shared by both the "confirmed by drone" mission view and the "picked but
+// not launched yet" planning view — same layer group, same drawing code,
+// whichever one is currently relevant just calls this with its own points.
+function drawWaypointsOnMap(pts) {
+  if (!M.map) return;
   M.waypoints.clearLayers();
-  const pts = (m.waypoints || []).map(([lat, lon]) => [lat, lon]);
   if (!pts.length) return;
   L.polyline(pts, { color: '#6b7885', weight: 2, dashArray: '4 5' }).addTo(M.waypoints);
   pts.forEach((ll, i) => {
@@ -51,6 +77,131 @@ function renderMission(m) {
       .addTo(M.waypoints);
   });
   M.map.fitBounds(pts, { padding: [24, 24] });
+}
+
+function renderMission(m) {
+  if (!m) return;
+  drawWaypointsOnMap((m.waypoints || []).map(([lat, lon]) => [lat, lon]));
+}
+
+/* ---------- mission planning: click the map to add waypoints ---------- */
+function onMapClickForPlanning(e) {
+  if (S.missionActive) return; // don't let clicks during a live mission look like a route change
+  S.plan.waypoints.push([e.latlng.lat, e.latlng.lng]);
+  renderPlanWaypoints();
+}
+
+function canLaunch() {
+  return S.plan.waypoints.length > 0 && !S.missionActive && !!S.activeMap;
+}
+
+function renderPlanWaypoints() {
+  const countEl = document.getElementById('planWpCount');
+  const btn = document.getElementById('planLaunchBtn');
+  if (countEl) countEl.textContent = S.plan.waypoints.length;
+  if (btn) btn.disabled = !canLaunch();
+  drawWaypointsOnMap(S.plan.waypoints);
+}
+
+function clearPlanWaypoints() {
+  S.plan.waypoints = [];
+  renderPlanWaypoints();
+}
+
+function renderPlanModes() {
+  const wrap = document.getElementById('planModeCards');
+  if (!wrap) return;
+  wrap.innerHTML = NAV_MODES.map(m => {
+    const active = m.name === S.plan.mode ? 'active' : '';
+    return `<div class="mode-card ${active}" onclick="selectPlanMode('${m.name}')">
+      <div class="mc-name">${m.name}</div>
+    </div>`;
+  }).join('');
+}
+
+function selectPlanMode(name) {
+  S.plan.mode = name;
+  renderPlanModes();
+}
+
+function updatePlanControlsEnabled() {
+  const note = document.getElementById('planNote');
+  const btn = document.getElementById('planLaunchBtn');
+  if (!note || !btn) return;
+  btn.disabled = !canLaunch();
+  if (S.missionActive) {
+    note.textContent = 'A mission is currently active — plan the next one once it ends, or STOP first.';
+  } else if (!S.activeMap) {
+    note.textContent = 'No map selected — pick a pre-staged one above, or upload via local WiFi first.';
+  } else {
+    note.textContent = 'Click the map to add waypoints, then Start mission.';
+  }
+}
+
+async function launchFromCloud() {
+  const payload = {
+    waypoints: S.plan.waypoints,
+    mode: S.plan.mode,
+    takeoff_alt: parseFloat(document.getElementById('planAlt').value),
+    nav_speed: parseFloat(document.getElementById('planSpeed').value),
+    min_valid_alt_m: parseFloat(document.getElementById('planMinAlt').value),
+    approx_start: null,
+  };
+  const btn = document.getElementById('planLaunchBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="launch-icon">▲</span> Sending…';
+  try {
+    await sendCloudCommand('start_mission', payload);
+    S.missionActive = true;
+    updatePlanControlsEnabled();
+    logLine('ok', 'Mission command sent — confirmed by drone.');
+  } catch (e) {
+    alert('Launch failed: ' + e.message);
+  } finally {
+    btn.innerHTML = '<span class="launch-icon">▲</span> Start mission';
+    btn.disabled = S.plan.waypoints.length === 0 || S.missionActive;
+  }
+}
+
+async function stopFromCloud() {
+  try {
+    await sendCloudCommand('stop', {});
+    S.missionActive = false;
+    updatePlanControlsEnabled();
+    logLine('err', 'STOP sent — confirmed by drone.');
+  } catch (e) {
+    logLine('err', 'STOP failed: ' + e.message);
+  }
+}
+
+/* ---------- command channel: send + ack (mirrors static/app.js) ---------- */
+function sendCloudCommand(action, params) {
+  return new Promise((resolve, reject) => {
+    if (!S.client || !S.client.connected) { reject(new Error('not connected to broker')); return; }
+    if (!S.selectedDrone) { reject(new Error('no drone selected')); return; }
+    const cmd_id = 'cmd-' + Date.now() + '-' + Math.random().toString(16).slice(2, 8);
+    const timeoutHandle = setTimeout(() => {
+      S.pendingCmds.delete(cmd_id);
+      reject(new Error('no response from drone within 5s'));
+    }, 5000);
+    S.pendingCmds.set(cmd_id, { resolve, reject, timeoutHandle });
+    S.client.publish(`wildnav/${S.selectedDrone}/cmd`, JSON.stringify({
+      cmd_id, action, params, ts: Date.now() / 1000,
+    }), { qos: 1 });
+  });
+}
+
+function handleCmdAck(ack) {
+  if (ack.status === 'received') {
+    logLine('setup', '» command received by drone, executing…');
+    return;
+  }
+  const pending = S.pendingCmds.get(ack.cmd_id);
+  if (!pending) return;
+  clearTimeout(pending.timeoutHandle);
+  S.pendingCmds.delete(ack.cmd_id);
+  if (ack.status === 'done') pending.resolve(ack);
+  else pending.reject(new Error(ack.detail || 'rejected'));
 }
 
 function updateMapPosition(t) {
@@ -115,9 +266,13 @@ function connectBroker() {
     S.client.subscribe('wildnav/+/lwt', { qos: 1 });
     S.client.subscribe('wildnav/+/events', { qos: 1 });
     S.client.subscribe('wildnav/+/mission', { qos: 1 });
+    S.client.subscribe('wildnav/+/cmd_ack', { qos: 1 });
+    S.client.subscribe('wildnav/+/maps', { qos: 1 });
     document.getElementById('stageConn').classList.add('hidden');
     document.getElementById('stageLive').classList.remove('hidden');
     initMap();
+    renderPlanModes();
+    updatePlanControlsEnabled();
     setTimeout(() => M.map && M.map.invalidateSize(), 50); // container was display:none at init
   });
   S.client.on('reconnect', () => setConn('connecting', 'reconnecting…'));
@@ -147,6 +302,7 @@ function onMqttMessage(topic, payloadBuf) {
 
   registerDrone(droneId, sub, data);
   if (sub === 'mission') S.missions.set(droneId, data); // cache regardless of selection
+  if (sub === 'maps') S.mapsByDrone.set(droneId, data); // same — a wildcard sub sees every drone
   if (droneId !== S.selectedDrone) return;
 
   // status and lwt carry the same {status, ts} shape — cloud_relay.py
@@ -159,7 +315,39 @@ function onMqttMessage(topic, payloadBuf) {
     return;
   }
   if (sub === 'events') { updateLatency(data.ts); handleEvent(data.event || {}); return; }
-  if (sub === 'mission') { renderMission(data); return; }
+  if (sub === 'mission') {
+    renderMission(data);
+    S.missionActive = true;
+    updatePlanControlsEnabled();
+    return;
+  }
+  if (sub === 'cmd_ack') { handleCmdAck(data); return; }
+  if (sub === 'maps') {
+    S.availableMaps = data.files || [];
+    S.activeMap = data.active || null;
+    renderMapSelect();
+    updatePlanControlsEnabled();
+    return;
+  }
+}
+
+function renderMapSelect() {
+  const sel = document.getElementById('planMapSelect');
+  if (!sel) return;
+  if (!S.availableMaps.length) {
+    sel.innerHTML = '<option value="">No map pre-staged — upload via local WiFi first</option>';
+    return;
+  }
+  sel.innerHTML = S.availableMaps.map(f =>
+    `<option value="${f}" ${f === S.activeMap ? 'selected' : ''}>${f}${f === S.activeMap ? ' (active)' : ''}</option>`
+  ).join('');
+}
+
+function selectMapRemote(filename) {
+  if (!filename) return;
+  sendCloudCommand('select_map', { filename })
+    .then(() => logLine('ok', `Active map set to ${filename} — confirmed by drone.`))
+    .catch(e => alert('Could not select map: ' + e.message));
 }
 
 // `data.ts` is when cloud_relay.py published this message to the broker
@@ -211,14 +399,25 @@ function selectDrone(id) {
   _latEma = null;
   setTel('telLatency', '—');
   resetMap();
+  S.plan.waypoints = [];
+  S.missionActive = false;
+  const cachedMaps = S.mapsByDrone.get(id);
+  S.availableMaps = cachedMaps ? (cachedMaps.files || []) : [];
+  S.activeMap = cachedMaps ? (cachedMaps.active || null) : null;
+  renderMapSelect();
+  updatePlanControlsEnabled();
   const cachedMission = S.missions.get(id);
-  if (cachedMission) renderMission(cachedMission);
+  if (cachedMission) { renderMission(cachedMission); S.missionActive = true; updatePlanControlsEnabled(); }
 }
 
 /* ---------- rendering (mirrors static/app.js) ---------- */
 function handleEvent(m) {
   if (m.kind === 'heartbeat') return;
   if (m.kind === 'telem') { updateTelemetry(m); return; }
+  if (m.kind === 'mission_complete' || m.kind === 'abort' || m.kind === 'engine_stopped') {
+    S.missionActive = false;
+    updatePlanControlsEnabled();
+  }
   routeEvent(m);
 }
 
